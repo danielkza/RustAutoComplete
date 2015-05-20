@@ -6,57 +6,50 @@ import os.path
 import platform
 import subprocess
 import threading
-import json
 from functools import partial
-from subprocess import Popen, PIPE, check_output
+from subprocess import Popen, PIPE
 from collections import OrderedDict
 
 import sublime
 import sublime_plugin
 
 
+settings = None
+
+
 class Settings:
-    _instance = None
-    KEYS = ["racer", "cargo", "search_paths"]
-
     def __init__(self):
-        self.package_settings = sublime.load_settings("RustAutoComplete.sublime-settings")
-        for key in self.KEYS:
-            self.package_settings.add_on_change(key, self.settings_changed)
-        
-        self.settings_changed()
+        package_settings = sublime.load_settings("RustAutoComplete.sublime-settings")
+        package_settings.add_on_change("racer", settings_changed)
+        package_settings.add_on_change("search_paths", settings_changed)
 
-    def settings_changed(self):
-        self.racer_bin = self.package_settings.get("racer", "racer")
-        self.cargo_bin = self.package_settings.get("cargo", "cargo")
-        self.search_paths = self.package_settings.get("search_paths", [])
+        self.racer_bin = package_settings.get("racer", "racer")
+        self.search_paths = package_settings.get("search_paths", [])
+        self.package_settings = package_settings
 
     def unload(self):
-        for key in self.KEYS:
-            self.package_settings.clear_on_change(key)
+        self.package_settings.clear_on_change("racer")
+        self.package_settings.clear_on_change("search_paths")
 
-    @classmethod
-    def _init(cls):
-        if not cls._instance:
-            cls._instance = cls()
-
-    @classmethod
-    def get(cls):
-        cls._init()
-        return cls._instance
-
-    @classmethod
-    def c_unload(cls):
-        if cls._instance:
-            cls._instance.unload()
-            cls._instance = None
 
 def plugin_loaded():
-    Settings._init()
+    global settings
+    settings = Settings()
 
 
 def plugin_unloaded():
-    Settings.c_unload()
+    global settings
+    if settings != None:
+        settings.unload()
+        settings = None
+
+
+def settings_changed():
+    global settings
+    if settings != None:
+        settings.unload()
+        settings = None
+    settings = Settings()
 
 
 class Result:
@@ -81,7 +74,6 @@ class RacerThread(threading.Thread):
         self.callback = callback
         self.timeout = timeout
 
-        self.src_path = RustProjectDirWatcher.get().get_view_src_path(view)
         self.with_snippet = False
         self.results = None
 
@@ -92,7 +84,7 @@ class RacerThread(threading.Thread):
         if cmd_list[0] == "complete-with-snippet":
             self.with_snippet = True
 
-        cmd_list.insert(0, Settings.get().racer_bin)
+        cmd_list.insert(0, settings.racer_bin)
         cmd_list.extend([str(self.row), str(self.col), '/dev/stdin'])
 
         env = self._get_racer_environment()
@@ -100,21 +92,18 @@ class RacerThread(threading.Thread):
         self.process = Popen(cmd_list, stdin=PIPE, stdout=PIPE, stderr=PIPE,
                              env=env)
 
-    def _get_racer_environment(self):
+    @classmethod
+    def _get_racer_environment(cls):
         env = os.environ.copy()
         # Keep what was already in the environment
         search_paths = filter(None, env.get('RUST_SRC_PATH', '').split(':'))
         # Append from settings
-        search_paths = list(search_paths) + Settings.get().search_paths
-        # Try to get the path for the current project
-        if self.src_path:
-            search_paths.append(self.src_path)
+        search_paths = list(search_paths) + settings.search_paths
         # Expand tilde for home
         search_paths = map(os.path.expanduser, search_paths)
         # We need to preserve the order but remove duplicates. Abuse an
         # OrderedDict for it
         search_paths = list(OrderedDict.fromkeys(search_paths))
-        print(search_paths)
         env['RUST_SRC_PATH'] = ':'.join(search_paths)
 
         return env
@@ -172,53 +161,6 @@ class RacerThread(threading.Thread):
         self.join()
         return self.results
 
-class RustProjectDirWatcher(sublime_plugin.EventListener):
-    _instance = None
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.file_names_cache = {}
-
-        RustProjectDirWatcher._instance = self
-
-    @classmethod
-    def get(cls):
-        return cls._instance
-
-    def _find_src_path_by_file(self, file_name):
-        cargo_bin = Settings.get().cargo_bin
-        if not cargo_bin:
-            return None
-
-        try:
-            print('cargo locate-project')
-            cargo_json = check_output([cargo_bin, 'locate-project'],
-                                      cwd=os.path.dirname(file_name))
-            cargo_json = json.loads(cargo_json.decode('utf-8'))
-            src_path = os.path.dirname(cargo_json['root']) + '/src'
-            if not os.path.isdir(src_path):
-                src_path = ''
-        except (subprocess.CalledProcessError, KeyError):
-            src_path = ''
-        except OSError:
-            src_path = None
-
-        return src_path
-
-    def get_view_src_path(self, view):
-        file_name = view.file_name()
-        if not file_name:
-            return None
-
-        src_path = self.file_names_cache.get(file_name, None)
-        if src_path is None:
-            src_path = self._find_src_path_by_file(file_name)
-            self.file_names_cache[file_name] = src_path
-
-        return src_path
-
-    def on_load(self, view):
-        self.file_names_cache.pop(view.file_name(), None)
 
 class RustAutocomplete(sublime_plugin.EventListener):
     def __init__(self, *args, **kwargs):
@@ -248,7 +190,7 @@ class RustAutocomplete(sublime_plugin.EventListener):
         self.results = None
         try:
             racer = RacerThread("complete-with-snippet", view, locations[0],
-                callback=partial(self.on_racer_results, current_completions_id))
+                                partial(self.on_racer_results, current_completions_id))
             racer.start()
         except FileNotFoundError:
             print("Unable to find racer executable (check settings)")
@@ -309,7 +251,6 @@ class RustGotoDefinitionCommand(sublime_plugin.TextCommand):
     def run(self, edit):
         # Get the buffer location in correct format for racer
         location = self.view.sel()[0].begin()
-        racer = RacerThread("find-definition", self.view, location,
-                            callback=self.on_racer_result)
+        racer = RacerThread("find-definition", self.view, location, self.on_racer_results)
         racer.start()
 
